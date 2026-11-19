@@ -40,7 +40,7 @@ def main(page: ft.Page):
     ingresar_dni = ft.TextField(label="Ingrese su DNI *", color=ft.Colors.BLUE_GREY_900)
     ingresar_nombre = ft.TextField(label="Ingrese su nombre *", color=ft.Colors.BLUE_GREY_900)
     ingresar_apellido = ft.TextField(label="Ingrese su apellido *", color=ft.Colors.BLUE_GREY_900)
-    elegir_especialidad = ft.Dropdown(label="Especialidad *", options=[ft.DropdownOption(e) for e in ESPECIALIDADES],)
+    elegir_especialidad = ft.Dropdown(label="Especialidad *", options=[ft.DropdownOption(e) for e in ESPECIALIDADES],color=ft.Colors.BLUE_GREY_900)
 
     #campo fecha del turno
 
@@ -49,38 +49,46 @@ def main(page: ft.Page):
     #campo motivo de consulta
 
     def solicitar_turno(e):
+        mensaje_confirmacion.visible = False #si ya se confirmó un turno, y se quiere solicitar otro, limpiamos el mensaje de confirmado anterior
+        
         for campo in (ingresar_dni, ingresar_nombre, ingresar_apellido, elegir_especialidad): #si hay un error marcado y se soluciona, lo desmarca
             campo.error = None
 
-        dni = ingresar_dni.value.strip() #guardo lo que se ingresó en el input
-        nombre = ingresar_nombre.value.strip() 
-        apellido = ingresar_apellido.value.strip()
-        especialidad = elegir_especialidad.value
-
         hay_error = False
 
-        if dni =="": #si está vacío
+        if ingresar_dni.value.strip() =="": #si está vacío
             ingresar_dni.error = "Ingresá tu DNI"
             hay_error = True
-        elif not dni.isdigit(): #si lo que guardo no son números
+        elif not ingresar_dni.value.strip().isdigit(): #si lo que guardo no son números
             ingresar_dni.error = "El DNI solo puede contener números"
             hay_error = True
 
-        if nombre =="":
+        if ingresar_nombre.value.strip() =="":
             ingresar_nombre.error = "Ingresá tu nombre"
             hay_error = True
 
-        if apellido =="":
+        if ingresar_apellido.value.strip() =="":
             ingresar_apellido.error = "Ingresá tu apellido"
             hay_error = True
 
-        if not especialidad: #el desplegable vale None si no se eligió nada
+        if not elegir_especialidad.value: #el desplegable vale None si no se eligió nada
             elegir_especialidad.error = "Seleccioná una especialidad"
             hay_error = True
 
-        page.update()
         if hay_error: #si termina en True, no se puede mandar el formulario
+            page.update()
             return
+
+        mensaje_confirmacion.visible = True #Si todo se ingresó bien, se muestra la confirmación
+        page.update()
+
+    mensaje_confirmacion = ft.Text( #configuramos el mensaje de confirmación
+        "¡Turno solicitado correctamente!",
+        color=ft.Colors.GREEN_700,
+        bgcolor = ft.Colors.LIGHT_GREEN_100,
+        weight=ft.FontWeight.BOLD,
+        visible=False,
+    )
             
     #funciones necesarias para el funcionamiento del formulario
 
@@ -105,10 +113,11 @@ def main(page: ft.Page):
                 #motivo_consulta,
                 ft.Button(
                     content = "Solicitar Turno",
-                    on_click = solicitar_turno,                    
+                    on_click = solicitar_turno,                 
                     bgcolor = ft.Colors.BLUE_700,
                     color = ft.Colors.WHITE
                 ),
+                mensaje_confirmacion, 
                 ft.Text("Los campos con * son obligatorios", size = 11, color = ft.Colors.BLUE_GREY)
             ]
         )
