@@ -64,17 +64,16 @@ function instante_(v) {
 }
 /** Último evento de cada turno en Historial_Turnos: {id_turno: {anterior, actual}}.
  *  Es la fuente de verdad de estado_anterior / estado_actual de la hoja Turnos.
+ *  El historial solo crece hacia abajo, así que el último evento es la ÚLTIMA FILA de ese turno.
+ *  (Antes se elegía por fecha_hora_evento: si había eventos cargados con fecha futura, le ganaban
+ *  a cualquier cambio nuevo, el cambio se "deshacía" y el sistema lo repetía en cada ejecución.)
  *  Se lee una sola vez por ejecución y registrar_ lo mantiene al día en memoria. */
 let ULT_ = null;
 function ultimosEstados_() {
   if (ULT_) return ULT_;
   const h = tabla_('Historial_Turnos'), m = {};
-  const ci = h.col('id_turno'), ca = h.col('estado_anterior'), cs = h.col('estado_actual'), cf = h.col('fecha_hora_evento');
-  h.filas.forEach((f) => {
-    const ts = instante_(f[cf]);
-    const prev = m[f[ci]];
-    if (!prev || ts >= prev.ts) m[f[ci]] = { ts, anterior: f[ca], actual: f[cs] };   // ante empate, gana la fila posterior
-  });
+  const ci = h.col('id_turno'), ca = h.col('estado_anterior'), cs = h.col('estado_actual');
+  h.filas.forEach((f) => { if (f[ci] !== '') m[f[ci]] = { anterior: f[ca], actual: f[cs] }; });
   return (ULT_ = m);
 }
 function filas_(t) {                       // filas como objetos (con fecha/horario normalizados)
@@ -90,14 +89,34 @@ function filas_(t) {                       // filas como objetos (con fecha/hora
 }
 const futuro_ = (o) => (o.fecha + ' ' + o.horario) > ahoraTxt_();
 
+/** Los eventos nuevos se juntan en memoria y se escriben TODOS JUNTOS con guardarHistorial_().
+ *  (appendRow + getLastRow por evento obligaba a Sheets a ir y volver en cada cambio: con muchos
+ *  cupos vencidos una sola ejecución podía tardar minutos y retener el candado.) */
+let PEND_H_ = [], ULTIMA_FILA_H_ = null;
 function registrar_(idTurno, anterior, actual, origen) {
-  const sh = SpreadsheetApp.getActive().getSheetByName('Historial_Turnos');
-  const id = 'H' + ('000000' + sh.getLastRow()).slice(-6);   // la fila 1 es el encabezado
+  if (ULTIMA_FILA_H_ === null)
+    ULTIMA_FILA_H_ = SpreadsheetApp.getActive().getSheetByName('Historial_Turnos').getLastRow();
+  const id = 'H' + ('000000' + (ULTIMA_FILA_H_ + PEND_H_.length)).slice(-6);   // la fila 1 es el encabezado
   const ahora = new Date();
-  sh.appendRow([id, idTurno, anterior, actual, ahora, origen]);
-  const m = ultimosEstados_(), prev = m[idTurno];   // mismo criterio que la lectura: gana el más reciente
-  if (!prev || ahora.getTime() >= prev.ts) m[idTurno] = { ts: ahora.getTime(), anterior, actual };
+  PEND_H_.push([id, idTurno, anterior, actual, ahora, origen]);
+  ultimosEstados_()[idTurno] = { anterior, actual };   // mismo criterio que la lectura: gana la última fila
 }
+/** Escribe de una vez los eventos pendientes en Historial_Turnos. */
+function guardarHistorial_() {
+  if (!PEND_H_.length) return;
+  const sh = SpreadsheetApp.getActive().getSheetByName('Historial_Turnos');
+  sh.getRange(ULTIMA_FILA_H_ + 1, 1, PEND_H_.length, PEND_H_[0].length).setValues(PEND_H_);
+  ULTIMA_FILA_H_ += PEND_H_.length; PEND_H_ = [];
+  SpreadsheetApp.flush();
+}
+/** Ocupado cuyo bloqueo de 5 minutos ya venció (o que no tiene ocupado_desde). */
+function vencido_(o) {
+  if (o.estado_actual !== 'Ocupado') return false;
+  const desde = o.ocupado_desde instanceof Date ? o.ocupado_desde.getTime() : 0;
+  return desde < Date.now() - MINUTOS_BLOQUEO * 60000;
+}
+/** Para mostrar cupos: un Ocupado vencido cuenta como Libre (se libera de verdad al reservar). */
+const disponible_ = (o) => o.estado_actual === 'Libre' || vencido_(o);
 
 /** Cambia el estado de un cupo, valida la transición y deja registro en Historial_Turnos. */
 function cambiar_(t, o, nuevo, extra, origen) {
@@ -139,18 +158,30 @@ function exigirPaciente_(dni) {
 }
 function sinSuperposicion_(fs, idPaciente, cupo, ignorar) {
   if (fs.some((x) => x.id_paciente === idPaciente && ACTIVOS.includes(x.estado_actual) &&
-      x.fecha === cupo.fecha && x.horario === cupo.horario && x.id_turno !== ignorar))
+      x.fecha === cupo.fecha && x.horario === cupo.horario &&
+      x.id_turno !== ignorar && x.id_turno !== cupo.id_turno))   // el propio cupo (p. ej. bloqueado por él) no cuenta
     throw falla_('DUPLICADO', 'Ya tiene un turno activo en ese día y horario.');
 }
 
 /** Ocupados con más de 5 minutos sin confirmar vuelven a Libre (se borra id_paciente y ocupado_desde). */
+// Tope de cupos que se liberan por ejecución: así ninguna ejecución retiene el candado mucho tiempo.
+// Si hay más, se liberan en las siguientes (las consultas ya los muestran como disponibles).
+const MAX_LIBERAR = 40;
 function liberarVencidos_() {
-  const t = tabla_('Turnos'), limite = Date.now() - MINUTOS_BLOQUEO * 60000;
-  filas_(t).forEach((o) => {
-    if (o.estado_actual !== 'Ocupado') return;
-    const desde = o.ocupado_desde instanceof Date ? o.ocupado_desde.getTime() : 0;
-    if (desde < limite) cambiar_(t, o, 'Libre', { id_paciente: '', ocupado_desde: '' }, 'Sistema (vencimiento)');
-  });
+  const t = tabla_('Turnos');
+  filas_(t).filter(vencido_).slice(0, MAX_LIBERAR).forEach((o) =>
+    cambiar_(t, o, 'Libre', { id_paciente: '', ocupado_desde: '' }, 'Sistema (vencimiento)'));
+}
+
+/** Reglas para reprogramar: el turno viejo es un Confirmado futuro del paciente y el nuevo es
+ *  de la misma especialidad y posterior. Devuelve el turno viejo. */
+function reglaReprogramacion_(fs, pac, idViejo, n) {
+  const v = fs.find((o) => o.id_turno === idViejo);
+  if (!v || v.estado_actual !== 'Confirmado' || v.id_paciente !== pac.id_paciente || !futuro_(v))
+    throw falla_('NO_REPROGRAMABLE', 'Ese turno no se puede reprogramar.');
+  if (n.especialidad !== v.especialidad || (n.fecha + n.horario) <= (v.fecha + v.horario))
+    throw falla_('REGLA', 'El nuevo turno debe ser de la misma especialidad y posterior al actual.');
+  return v;
 }
 
 // ───────────── Procedimientos ─────────────
@@ -170,26 +201,28 @@ const ACCIONES = {
   fechas(p) {
     const s = new Set();
     filas_(tabla_('Turnos')).forEach((o) => {
-      if (o.estado_actual === 'Libre' && o.especialidad === p.especialidad &&
+      if (disponible_(o) && o.especialidad === p.especialidad &&
           o.profesional === p.profesional && futuro_(o)) s.add(o.fecha);
     });
     return Array.from(s).sort();
   },
   horarios(p) {
     return filas_(tabla_('Turnos'))
-      .filter((o) => o.estado_actual === 'Libre' && o.especialidad === p.especialidad &&
+      .filter((o) => disponible_(o) && o.especialidad === p.especialidad &&
                      o.profesional === p.profesional && o.fecha === p.fecha && futuro_(o))
       .map((o) => ({ id_turno: o.id_turno, hora: o.horario }))
       .sort((a, b) => a.hora.localeCompare(b.hora));
   },
 
-  /** Libre -> Ocupado (bloquea el cupo 5 min). */
+  /** Libre -> Ocupado (bloquea el cupo 5 min). Si viene id_turno_viejo, es el nuevo horario de una
+   *  reprogramación: se validan las reglas ya al bloquear, para no retener un cupo que no sirve. */
   reservar(p) {
     const pac = exigirPaciente_(p.dni), t = tabla_('Turnos'), fs = filas_(t);
     const c = fs.find((o) => o.id_turno === p.id_turno);
     if (!c || c.estado_actual !== 'Libre' || !futuro_(c))
       throw falla_('NO_DISPONIBLE', 'Ese horario ya no está disponible.');
-    sinSuperposicion_(fs, pac.id_paciente, c, null);
+    if (p.id_turno_viejo) reglaReprogramacion_(fs, pac, p.id_turno_viejo, c);
+    sinSuperposicion_(fs, pac.id_paciente, c, p.id_turno_viejo || null);
     cambiar_(t, c, 'Ocupado', { id_paciente: pac.id_paciente, ocupado_desde: new Date(),
                                 cancelado_por: '', reprogramado_por: '' }, 'Paciente (chatbot)');
     return { id_turno: c.id_turno, minutos: MINUTOS_BLOQUEO };
@@ -232,18 +265,16 @@ const ACCIONES = {
     return { id_turno: c.id_turno };
   },
   /** Turno viejo -> Libre (reprogramado_por = Paciente); turno nuevo (posterior, misma especialidad) -> Confirmado. */
+  /** El nuevo horario tiene que estar bloqueado (Ocupado) por este paciente con reservar(..., id_turno_viejo).
+   *  Nuevo: Ocupado -> Confirmado. Viejo: Confirmado -> Libre (reprogramado_por = Paciente). */
   reprogramar(p) {
     const pac = exigirPaciente_(p.dni), t = tabla_('Turnos'), fs = filas_(t);
-    const v = fs.find((o) => o.id_turno === p.id_turno);
     const n = fs.find((o) => o.id_turno === p.id_turno_nuevo);
-    if (!v || v.estado_actual !== 'Confirmado' || v.id_paciente !== pac.id_paciente || !futuro_(v))
-      throw falla_('NO_REPROGRAMABLE', 'Ese turno no se puede reprogramar.');
-    if (!n || n.estado_actual !== 'Libre' || !futuro_(n))
-      throw falla_('NO_DISPONIBLE', 'El nuevo horario ya no está disponible.');
-    if (n.especialidad !== v.especialidad || (n.fecha + n.horario) <= (v.fecha + v.horario))
-      throw falla_('REGLA', 'El nuevo turno debe ser de la misma especialidad y posterior al actual.');
+    if (!n || n.estado_actual !== 'Ocupado' || n.id_paciente !== pac.id_paciente)
+      throw falla_('EXPIRADO', 'La reserva del nuevo horario venció y el horario fue liberado.');
+    const v = reglaReprogramacion_(fs, pac, p.id_turno, n);
     sinSuperposicion_(fs, pac.id_paciente, n, v.id_turno);
-    cambiar_(t, n, 'Confirmado', { id_paciente: pac.id_paciente, cancelado_por: '', reprogramado_por: '' }, 'Paciente (chatbot)');
+    cambiar_(t, n, 'Confirmado', { ocupado_desde: '', cancelado_por: '', reprogramado_por: '' }, 'Paciente (chatbot)');
     cambiar_(t, v, 'Libre', { id_paciente: '', reprogramado_por: 'Paciente' }, 'Paciente (chatbot)');
     return { id_turno: n.id_turno };
   },
@@ -253,21 +284,28 @@ const ACCIONES = {
 function salida_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
+// Acciones que solo leen: no toman el candado ni escriben, así nunca quedan esperando a otra ejecución.
+const SOLO_LECTURA = ['catalogo', 'paciente', 'fechas', 'horarios', 'turnos'];
+
 function doPost(e) {
   const lock = LockService.getScriptLock();
+  let conLock = false;
   try {
     const p = JSON.parse(e.postData.contents);
     if (p.token !== PropertiesService.getScriptProperties().getProperty('TOKEN'))
       return salida_({ ok: false, codigo: 'NO_AUTORIZADO', error: 'No autorizado' });
     const accion = Object.prototype.hasOwnProperty.call(ACCIONES, p.accion) ? ACCIONES[p.accion] : null;
     if (!accion) return salida_({ ok: false, codigo: 'ACCION', error: 'Acción desconocida' });
-    lock.waitLock(20000);
+    if (SOLO_LECTURA.includes(p.accion)) return salida_({ ok: true, datos: accion(p) });
+    if (!lock.tryLock(20000))
+      return salida_({ ok: false, codigo: 'OCUPADO', error: 'El sistema está procesando otra operación.' });
+    conLock = true;
     liberarVencidos_();
     return salida_({ ok: true, datos: accion(p) });
   } catch (err) {
     return salida_({ ok: false, codigo: err.codigo || 'ERROR', error: String(err.message || err) });
   } finally {
-    try { lock.releaseLock(); } catch (_) {}
+    if (conLock) { try { guardarHistorial_(); } finally { lock.releaseLock(); } }
   }
 }
 /** Trigger de tiempo: libera los cupos Ocupados vencidos y alinea Turnos con el historial.
@@ -275,14 +313,23 @@ function doPost(e) {
  *  la propia consulta ya libera los vencidos (doPost llama a liberarVencidos_). Antes esperaba
  *  el bloqueo hasta 20 s y, si no lo conseguía, la ejecución terminaba en error. */
 function liberarVencidos() {
-  const lock = LockService.getScriptLock();
+  const lock = LockService.getScriptLock(), t0 = Date.now();
   if (!lock.tryLock(2000)) { console.log('Ocupado por otra ejecución; se saltea esta vuelta.'); return; }
-  try { liberarVencidos_(); sincronizarEstados_(); } finally { lock.releaseLock(); }
+  try { liberarVencidos_(); sincronizarEstados_(); } finally { try { guardarHistorial_(); } finally { lock.releaseLock(); } }
+  console.log('liberarVencidos tardó %s ms', Date.now() - t0);
 }
 /** Ejecutar a mano cuando se quiera alinear Turnos con el historial de inmediato. */
 function sincronizarEstados() {
   const lock = LockService.getScriptLock(); lock.waitLock(20000);
-  try { sincronizarEstados_(); } finally { lock.releaseLock(); }
+  try { sincronizarEstados_(); } finally { try { guardarHistorial_(); } finally { lock.releaseLock(); } }
+}
+/** Ejecutar a mano para BORRAR el activador. No es imprescindible: cada reserva/cancelación ya libera
+ *  los vencidos y las consultas los muestran como disponibles. Sin activador no hay nadie más
+ *  peleando por el candado. Para alinear Turnos con el historial, ejecutar sincronizarEstados a mano. */
+function quitarTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter((tr) => tr.getHandlerFunction() === 'liberarVencidos')
+    .forEach((tr) => ScriptApp.deleteTrigger(tr));
 }
 /** Ejecutar UNA vez a mano desde el editor: borra el activador viejo (cada 1 min) y crea uno cada 5 min.
  *  Cada 1 minuto son 1440 ejecuciones por día, y las cuentas Gmail gratuitas tienen un tope de
@@ -293,4 +340,18 @@ function instalarTrigger() {
     .filter((tr) => tr.getHandlerFunction() === 'liberarVencidos')
     .forEach((tr) => ScriptApp.deleteTrigger(tr));
   ScriptApp.newTrigger('liberarVencidos').timeBased().everyMinutes(5).create();
+}
+/** Ejecutar a mano para ver en el registro (Ver > Registros) cuánto pesa cada hoja y cuánto tarda. */
+function diagnostico() {
+  const t0 = Date.now();
+  const t = tabla_('Turnos'), h = tabla_('Historial_Turnos'), fs = filas_(t);
+  const porEstado = {};
+  fs.forEach((o) => { porEstado[o.estado_actual] = (porEstado[o.estado_actual] || 0) + 1; });
+  console.log('Filas Turnos: %s | Filas Historial: %s', t.filas.length, h.filas.length);
+  console.log('Por estado (según historial): %s', JSON.stringify(porEstado));
+  console.log('Ocupados vencidos a liberar: %s', fs.filter(vencido_).length);
+  const cf = h.col('fecha_hora_evento'), futuros = h.filas.filter((f) => instante_(f[cf]) > Date.now()).length;
+  console.log('Eventos del historial con fecha FUTURA: %s', futuros);
+  console.log('Activadores: %s', ScriptApp.getProjectTriggers().map((x) => x.getHandlerFunction()).join(', '));
+  console.log('Lectura completa: %s ms', Date.now() - t0);
 }
