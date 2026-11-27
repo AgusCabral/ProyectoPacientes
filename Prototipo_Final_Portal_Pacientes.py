@@ -81,7 +81,9 @@ class API:
     def fechas(self, esp, prof):            return self._llamar("fechas", especialidad=esp, profesional=prof)
     def horarios(self, esp, prof, fecha):   return self._llamar("horarios", especialidad=esp, profesional=prof,
                                                                  fecha=fecha.isoformat())
-    def reservar(self, dni, id_turno):      return self._llamar("reservar", dni=dni, id_turno=id_turno)
+    def reservar(self, dni, id_turno, id_turno_viejo=None):   # id_turno_viejo: si es para reprogramar
+        extra = {"id_turno_viejo": id_turno_viejo} if id_turno_viejo else {}
+        return self._llamar("reservar", dni=dni, id_turno=id_turno, **extra)
     def confirmar(self, dni, id_turno):     return self._llamar("confirmar", dni=dni, id_turno=id_turno)
     def liberar(self, dni, id_turno):       return self._llamar("liberar", dni=dni, id_turno=id_turno)
     def turnos(self, dni):                  return self._llamar("turnos", dni=dni)
@@ -199,6 +201,11 @@ class Bot:
     def __init__(self, sesion):
         self.s, self.estado, self.tmp = sesion, "inicio", {}
         self.ops = []            # opciones numeradas que se están mostrando (fechas, horarios o turnos)
+        self.aviso = None        # si una operación terminó bien, datos para el pop-up (lo lee la interfaz)
+
+    def avisar(self, tipo, titulo, campos):
+        """tipo: 'confirmado' | 'cancelado' | 'reprogramado'; campos: [(etiqueta, valor), ...]"""
+        self.aviso = {"tipo": tipo, "titulo": titulo, "campos": campos}
 
     @property
     def api(self):
@@ -228,7 +235,7 @@ class Bot:
 
     def soltar_reserva(self):
         """Si quedó un cupo bloqueado (Ocupado) sin confirmar, lo devuelve a Libre."""
-        if self.estado == "confirmar" and self.tmp.get("id_turno"):
+        if self.estado in ("confirmar", "confirmar_reprogramacion") and self.tmp.get("id_turno"):
             try:
                 self.api.liberar(self.s.dni, self.tmp["id_turno"])
             except ErrorAPI:
@@ -237,6 +244,7 @@ class Bot:
     def responder(self, texto):
         """Se ejecuta en un hilo aparte (hace llamadas de red)."""
         t = norm(texto)
+        self.aviso = None
         try:
             if t in ("menu", "inicio", "cancelar", "salir", "volver"):      # intenciones globales
                 self.soltar_reserva()
@@ -247,8 +255,9 @@ class Bot:
                          "Escriba 'menu' en cualquier momento para volver al inicio."], [])
             return getattr(self, "_" + self.estado)(texto, t)
         except ErrorAPI as e:
+            self.soltar_reserva()           # si falló con un cupo bloqueado, no dejarlo retenido
             pref = f"⚠️ {e.mensaje} "
-            if e.codigo in ("RED", "CONFIG", "NO_AUTORIZADO", "ACCION", "ERROR"):
+            if e.codigo in ("RED", "CONFIG", "NO_AUTORIZADO", "ACCION", "ERROR", "OCUPADO"):
                 pref += "Intente nuevamente en unos instantes. "
             if self.s.dni:
                 return self.menu(pref)
@@ -354,7 +363,12 @@ class Bot:
         if re.search(r"^no\b|mantener", t):
             return self.menu("Perfecto, su turno sigue en pie. ")
         if re.search(r"\bsi\b|confirm|\bok\b|dale", t):
-            self.api.cancelar(self.s.dni, self.tmp["viejo"]["id_turno"])
+            v = self.tmp["viejo"]
+            self.api.cancelar(self.s.dni, v["id_turno"])
+            self.avisar("cancelado", "Turno cancelado",
+                        [("Especialidad", f"{v['especialidad']} · {v['profesional']}"),
+                         ("Fecha", f"{etiqueta_fecha(v['fecha'])} a las {v['hora']} hs"),
+                         ("Paciente", f"{self.s.nombre} (DNI {fmt_dni(self.s.dni)})")])
             return self.menu("✅ Turno cancelado. El horario quedó libre para otro paciente. ")
         return ["Responda 'Sí' o 'No'."], ["Sí, cancelar turno", "No, mantenerlo"]
 
@@ -462,14 +476,9 @@ class Bot:
         id_turno = libres[horas.index(d["hora"])]["id_turno"]
         resumen = (f"• Paciente: {self.s.nombre} (DNI {fmt_dni(self.s.dni)})\n• {d['esp']} · {d['prof']}\n"
                    f"• {etiqueta_fecha(d['fecha'])} a las {d['hora']} hs")
-        if d.get("reprogramar"):
-            d["id_turno_nuevo"] = id_turno
-            self.estado = "confirmar_reprogramacion"
-            return [f"{pref}Reprogramación:\n• Turno actual: {etiqueta_turno(d['viejo'])}\n"
-                    f"• Nuevo turno: {etiqueta_fecha(d['fecha'])} {d['hora']} hs · {d['prof']}\n\n¿Confirmamos el cambio?"], \
-                   ["Confirmar cambio", "Volver"]
-        try:
-            r = self.api.reservar(self.s.dni, id_turno)            # Libre -> Ocupado (bloqueo temporal)
+        viejo = d["viejo"]["id_turno"] if d.get("reprogramar") else None
+        try:   # Libre -> Ocupado: el cupo queda bloqueado 5 min a nombre del paciente (también al reprogramar)
+            r = self.api.reservar(self.s.dni, id_turno, viejo)
         except ErrorAPI as e:
             if e.codigo in ("NO_DISPONIBLE", "DUPLICADO"):
                 d.pop("hora")
@@ -477,6 +486,12 @@ class Bot:
                 return self.avanzar(f"⚠️ {e.mensaje} ")
             raise
         d["id_turno"] = id_turno
+        if d.get("reprogramar"):
+            self.estado = "confirmar_reprogramacion"
+            return [f"{pref}Reprogramación:\n• Turno actual: {etiqueta_turno(d['viejo'])}\n"
+                    f"• Nuevo turno: {etiqueta_fecha(d['fecha'])} {d['hora']} hs · {d['prof']}\n\n"
+                    f"Le reservo el nuevo horario por {r['minutos']} minutos. ¿Confirmamos el cambio?"], \
+                   ["Confirmar cambio", "Volver"]
         self.estado = "confirmar"
         return [f"{pref}Resumen del turno:\n{resumen}\n\n"
                 f"Le reservo este horario por {r['minutos']} minutos. ¿Confirmamos?"], ["Confirmar", "Cancelar"]
@@ -510,6 +525,11 @@ class Bot:
                 if e.codigo == "EXPIRADO":
                     return self.menu("⌛ Pasaron más de 5 minutos y el horario se liberó. Puede volver a pedirlo. ")
                 raise
+            d = self.tmp
+            self.avisar("confirmado", "¡Turno confirmado!",
+                        [("Especialidad", f"{d['esp']} · {d['prof']}"),
+                         ("Fecha", f"{etiqueta_fecha(d['fecha'])} a las {d['hora']} hs"),
+                         ("Paciente", f"{self.s.nombre} (DNI {fmt_dni(self.s.dni)})")])
             return self.menu("🎉 ¡Turno confirmado con éxito! Lo esperamos. ")
         if re.search(r"^no\b", t):
             self.soltar_reserva()
@@ -520,17 +540,25 @@ class Bot:
         if re.search(r"\bsi\b|confirm|\bok\b|dale", t):
             d = self.tmp
             try:
-                self.api.reprogramar(self.s.dni, d["viejo"]["id_turno"], d["id_turno_nuevo"])
+                self.api.reprogramar(self.s.dni, d["viejo"]["id_turno"], d["id_turno"])
             except ErrorAPI as e:
-                if e.codigo in ("NO_DISPONIBLE", "DUPLICADO"):
-                    d.pop("hora"), d.pop("fechas", None)
-                    return self.avanzar(f"⚠️ {e.mensaje} ")
+                if e.codigo == "EXPIRADO":
+                    return self.menu("⌛ Pasaron más de 5 minutos y el nuevo horario se liberó. "
+                                     "Su turno original se mantiene. ")
                 raise
+            v = d["viejo"]
+            self.avisar("reprogramado", "Turno reprogramado",
+                        [("Especialidad", f"{d['esp']} · {d['prof']}"),
+                         ("Antes", f"{etiqueta_fecha(v['fecha'])} a las {v['hora']} hs"),
+                         ("Ahora", f"{etiqueta_fecha(d['fecha'])} a las {d['hora']} hs")])
             return self.menu(f"🔁 ¡Listo! Su turno quedó para el {etiqueta_fecha(d['fecha'])} a las {d['hora']} hs "
                              f"con {d['prof']}. ")
         if re.search(r"^no\b", t):
+            self.soltar_reserva()                                  # libera el nuevo horario bloqueado
             return self.menu("Su turno original se mantiene. ")
         return ["Responda 'Confirmar cambio' o 'Volver'."], ["Confirmar cambio", "Volver"]
+
+
 # ───────────────────────── Interfaz (Flet) ─────────────────────────
 def sombra():
     return ft.BoxShadow(blur_radius=18, color="#331E6FD9", offset=ft.Offset(0, 6))
@@ -596,6 +624,36 @@ def chip(texto, on_click):
         animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
         animate_scale=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
         on_hover=hover, on_tap_down=presion, on_click=on_click)
+
+
+AVISOS = {   # tipo -> (ícono, color)
+    "confirmado": (ft.Icons.CHECK_CIRCLE_ROUNDED, "#1E9E6A"),
+    "cancelado": (ft.Icons.CANCEL_ROUNDED, "#D64545"),
+    "reprogramado": (ft.Icons.EVENT_REPEAT_ROUNDED, AZUL),
+}
+
+
+def dialogo_aviso(aviso, cerrar):
+    """Pop-up que informa una confirmación, cancelación o reprogramación."""
+    icono, color = AVISOS[aviso["tipo"]]
+    filas = [ft.Row([ft.Text(etq, color=GRIS, size=13, width=95),
+                     ft.Text(val, color=TEXTO, size=14, weight=ft.FontWeight.W_600, expand=True)],
+                    vertical_alignment=ft.CrossAxisAlignment.START)
+             for etq, val in aviso["campos"]]
+    return ft.AlertDialog(
+        modal=True, bgcolor=BLANCO, shape=ft.RoundedRectangleBorder(radius=22),
+        icon=ft.Row([ft.Container(ft.Icon(icono, color=color, size=46), width=78, height=78, border_radius=39,
+                                  bgcolor=ft.Colors.with_opacity(0.12, color), alignment=ft.Alignment.CENTER)],
+                    alignment=ft.MainAxisAlignment.CENTER),
+        title=ft.Text(aviso["titulo"], color=TEXTO, size=22, weight=ft.FontWeight.BOLD,
+                      text_align=ft.TextAlign.CENTER),
+        content=ft.Container(ft.Column(filas, spacing=10, tight=True), width=380,
+                             padding=ft.Padding.symmetric(horizontal=16, vertical=14),
+                             bgcolor=AZUL_SUAVE, border_radius=14),
+        actions=[ft.Container(ft.Text("Entendido", color=BLANCO, size=15, weight=ft.FontWeight.BOLD),
+                              padding=ft.Padding.symmetric(horizontal=34, vertical=12), border_radius=24,
+                              gradient=degradado(AZUL, AZUL_OSC), ink=True, on_click=cerrar)],
+        actions_alignment=ft.MainAxisAlignment.CENTER)
 
 
 def main(page: ft.Page):
@@ -680,6 +738,9 @@ def main(page: ft.Page):
                 ocupado["v"] = False
                 conversacion.controls.remove(escribiendo)
             bot_dice(*respuesta)
+            if bot.aviso:                                           # pop-up de confirmación/cancelación/reprogramación
+                page.show_dialog(dialogo_aviso(bot.aviso, lambda e: page.pop_dialog()))
+                bot.aviso = None
             await entrada.focus()                                   # el campo sigue activo para escribir
 
         async def enviar_texto(e):                                  # Enter o botón Enviar
